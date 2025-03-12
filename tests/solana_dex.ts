@@ -360,6 +360,169 @@ describe("solana_dex", () => {
       throw error;
     }
   });
+
+  it("Removes liquidity from the pair", async () => {
+    try {
+      // Get the user's token accounts (these should already exist from add_liquidity test)
+      const userToken0Account = getAssociatedTokenAddressSync(
+        token0,
+        wallet.publicKey
+      );
+      
+      const userToken1Account = getAssociatedTokenAddressSync(
+        token1,
+        wallet.publicKey
+      );
+      
+      const userLpTokenAccount = getAssociatedTokenAddressSync(
+        lpMintKeypair.publicKey,
+        wallet.publicKey
+      );
+      
+      // First we need to check the current balances to know what we're working with
+      let userToken0Balance = await getTokenBalance(provider.connection, userToken0Account);
+      let userToken1Balance = await getTokenBalance(provider.connection, userToken1Account);
+      let userLpBalance = await getTokenBalance(provider.connection, userLpTokenAccount);
+      
+      console.log("Before removal - Token0 balance:", userToken0Balance);
+      console.log("Before removal - Token1 balance:", userToken1Balance);
+      console.log("Before removal - LP token balance:", userLpBalance);
+      
+      // Get pair state before removal
+      let pairBeforeRemoval = await program.account.pairAccount.fetch(pairAddress);
+      console.log("Pair reserves before removal - Reserve0:", pairBeforeRemoval.reserve0.toString());
+      console.log("Pair reserves before removal - Reserve1:", pairBeforeRemoval.reserve1.toString());
+      console.log("Pair total supply before removal:", pairBeforeRemoval.totalSupply.toString());
+      
+      // Amount of LP tokens to remove (50% of user's balance)
+      const liquidityToRemove = new anchor.BN(Math.floor(userLpBalance));
+      
+      // Calculate minimum amounts (with some slippage tolerance)
+      const slippageTolerance = 0.95; // 5% slippage tolerance
+      const expectedAmount0 = Math.floor(
+        (userLpBalance / 2) * 
+        Number(pairBeforeRemoval.reserve0) / 
+        Number(pairBeforeRemoval.totalSupply)
+      );
+      const expectedAmount1 = Math.floor(
+        (userLpBalance / 2) * 
+        Number(pairBeforeRemoval.reserve1) / 
+        Number(pairBeforeRemoval.totalSupply)
+      );
+      
+      const amount0Min = new anchor.BN(Math.floor(expectedAmount0 * slippageTolerance));
+      const amount1Min = new anchor.BN(Math.floor(expectedAmount1 * slippageTolerance));
+      
+      console.log("Removing liquidity:", liquidityToRemove.toString());
+      console.log("Expected amount0:", expectedAmount0);
+      console.log("Expected amount1:", expectedAmount1);
+      console.log("Minimum amount0:", amount0Min.toString());
+      console.log("Minimum amount1:", amount1Min.toString());
+      
+      // Call remove_liquidity
+      const tx = await program.methods
+        .removeLiquidity(
+          liquidityToRemove,
+          amount0Min,
+          amount1Min
+        )
+        .accounts({
+          factory: factoryKeypair.publicKey,
+          pair: pairAddress,
+          token0Account: token0AccountKeypair.publicKey,
+          token1Account: token1AccountKeypair.publicKey,
+          token0To: userToken0Account,
+          token1To: userToken1Account,
+          lpMint: lpMintKeypair.publicKey,
+          liquidityFrom: userLpTokenAccount,
+          authority: authorityPDA,
+          sender: wallet.publicKey,
+          owner: wallet.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc({ commitment: 'confirmed' });
+      
+      console.log("Liquidity removed transaction signature:", tx);
+      
+      // Get transaction details and logs
+      const txDetails = await provider.connection.getTransaction(tx, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0
+      });
+      
+      if (txDetails && txDetails.meta && txDetails.meta.logMessages) {
+        console.log("Transaction logs:", txDetails.meta.logMessages);
+      }
+      
+      // Verify token balances after removing liquidity
+      let newUserToken0Balance = await getTokenBalance(provider.connection, userToken0Account);
+      let newUserToken1Balance = await getTokenBalance(provider.connection, userToken1Account);
+      let newUserLpBalance = await getTokenBalance(provider.connection, userLpTokenAccount);
+      
+      console.log("After removal - Token0 balance:", newUserToken0Balance);
+      console.log("After removal - Token1 balance:", newUserToken1Balance);
+      console.log("After removal - LP token balance:", newUserLpBalance);
+      
+      // Calculate actual amounts received
+      const token0Received = newUserToken0Balance - userToken0Balance;
+      const token1Received = newUserToken1Balance - userToken1Balance;
+      const lpBurned = userLpBalance - newUserLpBalance;
+      
+      console.log("Token0 received:", token0Received);
+      console.log("Token1 received:", token1Received);
+      console.log("LP tokens burned:", lpBurned);
+      
+      // Verify pair state after removal
+      const pairAfterRemoval = await program.account.pairAccount.fetch(pairAddress);
+      
+      console.log("Pair reserves after removal - Reserve0:", pairAfterRemoval.reserve0.toString());
+      console.log("Pair reserves after removal - Reserve1:", pairAfterRemoval.reserve1.toString());
+      console.log("Pair total supply after removal:", pairAfterRemoval.totalSupply.toString());
+      
+      // Verify the state changes
+      assert.equal(
+        pairBeforeRemoval.reserve0.sub(pairAfterRemoval.reserve0).toString(),
+        token0Received.toString(),
+        "Reserve0 reduction should match token0 received"
+      );
+      
+      assert.equal(
+        pairBeforeRemoval.reserve1.sub(pairAfterRemoval.reserve1).toString(),
+        token1Received.toString(),
+        "Reserve1 reduction should match token1 received"
+      );
+      
+      assert.equal(
+        pairBeforeRemoval.totalSupply.sub(pairAfterRemoval.totalSupply).toString(),
+        lpBurned.toString(),
+        "Total supply reduction should match LP tokens burned"
+      );
+      
+      // Verify minimums were met
+      assert.isAtLeast(
+        token0Received,
+        parseInt(amount0Min.toString()),
+        "Token0 received should be at least minimum"
+      );
+      
+      assert.isAtLeast(
+        token1Received,
+        parseInt(amount1Min.toString()),
+        "Token1 received should be at least minimum"
+      );
+      
+      // Verify LP tokens were burned correctly
+      assert.equal(
+        lpBurned,
+        parseInt(liquidityToRemove.toString()),
+        "LP tokens burned should match requested amount"
+      );
+      
+    } catch (error) {
+      console.error("Error removing liquidity:", error);
+      throw error;
+    }
+  });
   
   // Helper functions
   async function mintToWallet(connection, payer, mint, destination, authority, amount) {

@@ -270,6 +270,112 @@ pub mod solana_dex {
         Ok(())
     }
 
+    pub fn remove_liquidity(
+        ctx: Context<RemoveLiquidity>,
+        liquidity: u128,
+        amount0_min: u128,
+        amount1_min: u128,
+    ) -> Result<()> {
+        // Ensure pair is initialized
+        require!(ctx.accounts.pair.is_initialized, DexError::PairNotInitialized);
+    
+        // Get current reserves and total supply
+        let reserve0 = ctx.accounts.pair.reserve0;
+        let reserve1 = ctx.accounts.pair.reserve1;
+        let total_supply = ctx.accounts.pair.total_supply;
+    
+        // Convert liquidity to u64 since that's what token operations require
+        let liquidity_u64 = u64::try_from(liquidity)
+            .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+        // Calculate token amounts based on proportion of liquidity
+        let amount0 = liquidity
+            .checked_mul(reserve0 as u128)
+            .unwrap()
+            .checked_div(total_supply as u128)
+            .unwrap();
+    
+        let amount1 = liquidity
+            .checked_mul(reserve1 as u128)
+            .unwrap()
+            .checked_div(total_supply as u128)
+            .unwrap();
+    
+        // Ensure minimum amounts are met
+        require!(
+            amount0 >= amount0_min && amount1 >= amount1_min,
+            DexError::InsufficientAmount
+        );
+    
+        // Convert to u64 for token operations
+        let amount0_u64 = u64::try_from(amount0)
+            .map_err(|_| error!(DexError::AmountOverflow))?;
+        let amount1_u64 = u64::try_from(amount1)
+            .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+        // Burn LP tokens first
+        token::burn(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Burn {
+                    mint: ctx.accounts.lp_mint.to_account_info(),
+                    from: ctx.accounts.liquidity_from.to_account_info(),
+                    authority: ctx.accounts.sender.to_account_info(),
+                },
+            ),
+            liquidity_u64,
+        )?;
+    
+        // Transfer tokens to user
+        let pair_key = ctx.accounts.pair.key();
+        let authority_seeds = &[
+            b"authority".as_ref(),
+            pair_key.as_ref(),
+            &[ctx.accounts.pair.authority_bump],
+        ];
+    
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.token0_account.to_account_info(),
+                    to: ctx.accounts.token0_to.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                &[authority_seeds],
+            ),
+            amount0_u64,
+        )?;
+    
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.token1_account.to_account_info(),
+                    to: ctx.accounts.token1_to.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                &[authority_seeds],
+            ),
+            amount1_u64,
+        )?;
+    
+        // Update pair account
+        ctx.accounts.pair.reserve0 = reserve0.checked_sub(amount0_u64).unwrap();
+        ctx.accounts.pair.reserve1 = reserve1.checked_sub(amount1_u64).unwrap();
+        ctx.accounts.pair.total_supply = total_supply.checked_sub(liquidity_u64).unwrap();
+    
+        // Emit event
+        emit!(LiquidityRemovedEvent {
+            sender: ctx.accounts.sender.key(),
+            amount0: amount0_u64,
+            amount1: amount1_u64,
+            liquidity: liquidity_u64,
+        });
+    
+        Ok(())
+    }
+
 }
 
 #[derive(Accounts)]
@@ -563,6 +669,83 @@ pub struct AddLiquidity<'info> {
 // Add this event
 #[event]
 pub struct LiquidityAddedEvent {
+    pub sender: Pubkey,
+    pub amount0: u64,
+    pub amount1: u64,
+    pub liquidity: u64,
+}
+
+// Add this accounts struct
+#[derive(Accounts)]
+pub struct RemoveLiquidity<'info> {
+    #[account(
+        mut,
+        has_one = owner @ DexError::NotFactoryOwner,
+    )]
+    pub factory: Account<'info, Factory>,
+    
+    #[account(
+        mut,
+        constraint = pair.is_initialized @ DexError::PairNotInitialized,
+        constraint = pair.factory == factory.key() @ DexError::InvalidPairFactory,
+        constraint = pair.token0_account == token0_account.key() @ DexError::InvalidTokenAccount,
+        constraint = pair.token1_account == token1_account.key() @ DexError::InvalidTokenAccount,
+        constraint = pair.lp_mint == lp_mint.key() @ DexError::InvalidLpMint,
+    )]
+    pub pair: Account<'info, PairAccount>,
+    
+    #[account(mut)]
+    pub token0_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub token1_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = token0_to.mint == pair.token0 @ DexError::InvalidTokenAccount,
+        constraint = token0_to.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub token0_to: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = token1_to.mint == pair.token1 @ DexError::InvalidTokenAccount,
+        constraint = token1_to.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub token1_to: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub lp_mint: Account<'info, Mint>,
+    
+    #[account(
+        mut,
+        constraint = liquidity_from.mint == lp_mint.key() @ DexError::InvalidTokenAccount,
+        constraint = liquidity_from.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub liquidity_from: Account<'info, TokenAccount>,
+    
+    /// CHECK: This is the PDA authority for the pair
+    #[account(
+        seeds = [
+            b"authority".as_ref(),
+            pair.key().as_ref()
+        ],
+        bump = pair.authority_bump
+    )]
+    pub authority: UncheckedAccount<'info>,
+    
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    
+    /// CHECK: Factory owner required for authorization
+    pub owner: UncheckedAccount<'info>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+// Add this event
+#[event]
+pub struct LiquidityRemovedEvent {
     pub sender: Pubkey,
     pub amount0: u64,
     pub amount1: u64,
