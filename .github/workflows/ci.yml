@@ -44,9 +44,11 @@ jobs:
       # Install Solana CLI
       - name: Install Solana CLI
         run: |
-          sh -c "$(curl -sSfL https://release.solana.com/v1.16.5/install)"
-          echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
-          solana --version
+            sh -c "$(curl -sSfL https://release.solana.com/v1.18.20/install)"
+            export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+            echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
+            solana --version  
+        
 
       # Install Anchor CLI using AVM
       - name: Install Anchor via AVM
