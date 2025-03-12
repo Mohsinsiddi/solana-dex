@@ -69,6 +69,8 @@ jobs:
       # Run tests
       - name: Run tests
         run: |
+          anchor build
+          anchor build
           anchor test --provider.wallet ./abcsuNAe31uDTaKBCmvsNuL3f3yq42eUTVkYQM6142F.json
       
       # Run additional lint checks (optional)
