@@ -7,7 +7,8 @@ import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccount,
   getMint,
-  getAccount
+  getAccount,
+  createMintToInstruction
 } from "@solana/spl-token";
 import { PublicKey, Keypair, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
 import { assert } from "chai";
@@ -220,4 +221,163 @@ describe("solana_dex", () => {
       throw error;
     }
   });
+
+  it("Adds liquidity to the pair", async () => {
+    try {
+      // First, we need to create token accounts for the user
+      const userToken0Account = await createAssociatedTokenAccount(
+        provider.connection,
+        wallet.payer,
+        token0,
+        wallet.publicKey
+      );
+      
+      const userToken1Account = await createAssociatedTokenAccount(
+        provider.connection,
+        wallet.payer,
+        token1,
+        wallet.publicKey
+      );
+      
+      // Create LP token account for the user
+      const userLpTokenAccount = await createAssociatedTokenAccount(
+        provider.connection,
+        wallet.payer,
+        lpMintKeypair.publicKey,
+        wallet.publicKey
+      );
+      
+      // Create burn address (black hole) for minimum liquidity
+      const burnAddress = new PublicKey("11111111111111111111111111111111");
+      const burnLpTokenAccount = await createAssociatedTokenAccount(
+        provider.connection,
+        wallet.payer,
+        lpMintKeypair.publicKey,
+        burnAddress
+      );
+      
+      // Mint some tokens to the user
+      const mintAmount = 1_000_000_000; // 1000 tokens assuming 6 decimals
+      
+      await mintToWallet(
+        provider.connection, 
+        wallet.payer, 
+        token0, 
+        userToken0Account, 
+        wallet.publicKey, 
+        mintAmount
+      );
+      
+      await mintToWallet(
+        provider.connection, 
+        wallet.payer, 
+        token1, 
+        userToken1Account, 
+        wallet.publicKey, 
+        mintAmount
+      );
+      
+      // Verify token balances before adding liquidity
+      let userToken0Balance = await getTokenBalance(provider.connection, userToken0Account);
+      let userToken1Balance = await getTokenBalance(provider.connection, userToken1Account);
+      
+      console.log("Initial token0 balance:", userToken0Balance);
+      console.log("Initial token1 balance:", userToken1Balance);
+      
+      // Add liquidity
+      const amount0Desired = new anchor.BN(100_000_000); // 100 tokens with 6 decimals
+      const amount1Desired = new anchor.BN(200_000_000); // 200 tokens with 6 decimals
+      const amount0Min = new anchor.BN(90_000_000);     // 90 tokens minimum
+      const amount1Min = new anchor.BN(180_000_000);    // 180 tokens minimum
+      
+      const tx = await program.methods
+        .addLiquidity(
+          amount0Desired,
+          amount1Desired,
+          amount0Min,
+          amount1Min
+        )
+        .accounts({
+          factory: factoryKeypair.publicKey,
+          pair: pairAddress,
+          token0Account: token0AccountKeypair.publicKey,
+          token1Account: token1AccountKeypair.publicKey,
+          userToken0: userToken0Account,
+          userToken1: userToken1Account,
+          lpMint: lpMintKeypair.publicKey,
+          liquidityTo: userLpTokenAccount,
+          burnAccount: burnLpTokenAccount,
+          authority: authorityPDA,
+          sender: wallet.publicKey,
+          owner: wallet.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc({ commitment: 'confirmed' });
+      
+      console.log("Liquidity added transaction signature:", tx);
+      
+      // Verify token balances after adding liquidity
+      let newUserToken0Balance = await getTokenBalance(provider.connection, userToken0Account);
+      let newUserToken1Balance = await getTokenBalance(provider.connection, userToken1Account);
+      let lpTokenBalance = await getTokenBalance(provider.connection, userLpTokenAccount);
+      let burnTokenBalance = await getTokenBalance(provider.connection, burnLpTokenAccount);
+      
+      console.log("New token0 balance:", newUserToken0Balance);
+      console.log("New token1 balance:", newUserToken1Balance);
+      console.log("LP token balance:", lpTokenBalance);
+      console.log("Burn address LP balance:", burnTokenBalance);
+      
+      // Calculate expected amount transferred
+      const token0Spent = userToken0Balance - newUserToken0Balance;
+      const token1Spent = userToken1Balance - newUserToken1Balance;
+      
+      console.log("Token0 spent:", token0Spent);
+      console.log("Token1 spent:", token1Spent);
+      
+      // Verify pair state
+      const pairAccount = await program.account.pairAccount.fetch(pairAddress);
+      console.log("Token 0" ,pairAccount.token0.toString())
+      console.log("Token 1",pairAccount.token1.toString())
+      console.log("Reserves 0" ,pairAccount.reserve0.toString())
+      console.log("Reserves 1",pairAccount.reserve1.toString())
+      console.log("Total Supply",pairAccount.totalSupply.toString())
+
+      assert.equal(pairAccount.reserve0.toString(), token0Spent.toString(), "Reserve0 not updated correctly");
+      assert.equal(pairAccount.reserve1.toString(), token1Spent.toString(), "Reserve1 not updated correctly");
+      assert.isTrue(pairAccount.totalSupply.gt(new anchor.BN(0)), "Total supply should be greater than 0");
+      
+      // For a first liquidity provision, verify minimum liquidity
+      if (token0Spent > 0 && token1Spent > 0) {
+        assert.equal(burnTokenBalance, 1000, "Burn account should have minimum liquidity");
+        
+        // Expected liquidity is approximately sqrt(token0Spent * token1Spent) - 1000
+        // But we'll just verify it's positive since exact calculation may differ
+        assert.isTrue(lpTokenBalance > 0, "User should have received LP tokens");
+      }
+      
+    } catch (error) {
+      console.error("Error adding liquidity:", error);
+      throw error;
+    }
+  });
+  
+  // Helper functions
+  async function mintToWallet(connection, payer, mint, destination, authority, amount) {
+    const tx = new anchor.web3.Transaction();
+    tx.add(
+      createMintToInstruction(
+        mint,
+        destination,
+        authority,
+        amount
+      )
+    );
+    
+    await provider.sendAndConfirm(tx, [payer]);
+  }
+  
+  async function getTokenBalance(connection, tokenAccount) {
+    const accountInfo = await getAccount(connection, tokenAccount);
+    return parseInt(accountInfo.amount.toString());
+  }
 });

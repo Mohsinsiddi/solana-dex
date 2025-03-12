@@ -81,6 +81,195 @@ pub mod solana_dex {
 
         Ok(())
     }
+
+    pub fn add_liquidity(
+        ctx: Context<AddLiquidity>,
+        amount0_desired: u128,
+        amount1_desired: u128,
+        amount0_min: u128,
+        amount1_min: u128,
+    ) -> Result<()> {
+        // Ensure pair is initialized
+        require!(ctx.accounts.pair.is_initialized, DexError::PairNotInitialized);
+    
+        // Get current reserves
+        let reserve0 = ctx.accounts.pair.reserve0;
+        let reserve1 = ctx.accounts.pair.reserve1;
+        let total_supply = ctx.accounts.pair.total_supply;
+    
+        // Calculate liquidity amounts
+        let (amount0, amount1, liquidity) = if reserve0 == 0 && reserve1 == 0 {
+            // First liquidity provision
+            // Use the full amounts provided but ensure they don't exceed u64::MAX
+            let amount0 = u64::try_from(amount0_desired)
+                .map_err(|_| error!(DexError::AmountOverflow))?;
+            let amount1 = u64::try_from(amount1_desired)
+                .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+            // Initial liquidity is the geometric mean of the amounts
+            let initial_liquidity = sqrt(
+                (amount0 as u128).checked_mul(amount1 as u128).unwrap()
+            ) as u64;
+    
+            // Enforce minimum liquidity
+            let liquidity = initial_liquidity.checked_sub(1000).unwrap_or(0);
+    
+            // Minimum liquidity check
+            require!(liquidity > 0, DexError::InsufficientLiquidityMinted);
+    
+            (amount0, amount1, liquidity)
+        } else {
+            // Not the first provision, calculate based on existing reserves
+            let amount1_optimal = amount0_desired
+                .checked_mul(reserve1 as u128)
+                .unwrap()
+                .checked_div(reserve0 as u128)
+                .unwrap();
+    
+            if amount1_optimal <= amount1_desired {
+                // amount1_optimal is the binding amount
+                require!(
+                    amount1_optimal >= amount1_min,
+                    DexError::InsufficientAmount
+                );
+    
+                let liquidity = amount0_desired
+                    .checked_mul(total_supply as u128)
+                    .unwrap()
+                    .checked_div(reserve0 as u128)
+                    .unwrap();
+    
+                // Convert to u64 for actual token transfers
+                let amount0_u64 = u64::try_from(amount0_desired)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+                let amount1_u64 = u64::try_from(amount1_optimal)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+                let liquidity_u64 = u64::try_from(liquidity)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+                (amount0_u64, amount1_u64, liquidity_u64)
+            } else {
+                // amount0_optimal is the binding amount
+                let amount0_optimal = amount1_desired
+                    .checked_mul(reserve0 as u128)
+                    .unwrap()
+                    .checked_div(reserve1 as u128)
+                    .unwrap();
+    
+                require!(
+                    amount0_optimal >= amount0_min,
+                    DexError::InsufficientAmount
+                );
+    
+                let liquidity = amount1_desired
+                    .checked_mul(total_supply as u128)
+                    .unwrap()
+                    .checked_div(reserve1 as u128)
+                    .unwrap();
+    
+                // Convert to u64 for actual token transfers
+                let amount0_u64 = u64::try_from(amount0_optimal)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+                let amount1_u64 = u64::try_from(amount1_desired)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+                let liquidity_u64 = u64::try_from(liquidity)
+                    .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+                (amount0_u64, amount1_u64, liquidity_u64)
+            }
+        };
+    
+        // Ensure minimum liquidity amounts
+        require!(
+            amount0 as u128 >= amount0_min && amount1 as u128 >= amount1_min,
+            DexError::InsufficientAmount
+        );
+    
+        // Transfer tokens from user to pair
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.user_token0.to_account_info(),
+                    to: ctx.accounts.token0_account.to_account_info(),
+                    authority: ctx.accounts.sender.to_account_info(),
+                },
+            ),
+            amount0,
+        )?;
+    
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.user_token1.to_account_info(),
+                    to: ctx.accounts.token1_account.to_account_info(),
+                    authority: ctx.accounts.sender.to_account_info(),
+                },
+            ),
+            amount1,
+        )?;
+        
+        // Mint LP tokens to user
+        let pair_key = ctx.accounts.pair.key();
+        let authority_seeds = &[
+            b"authority".as_ref(),
+            pair_key.as_ref(),
+            &[ctx.accounts.pair.authority_bump],
+        ];
+    
+        // If this is the first deposit, mint minimum liquidity to burn account
+        if reserve0 == 0 && reserve1 == 0 {
+            // Mint minimum liquidity to burn address
+            token::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    token::MintTo {
+                        mint: ctx.accounts.lp_mint.to_account_info(),
+                        to: ctx.accounts.burn_account.to_account_info(),
+                        authority: ctx.accounts.authority.to_account_info(),
+                    },
+                    &[authority_seeds],
+                ),
+                1000, // Minimum liquidity
+            )?;
+        }
+    
+        // Mint LP tokens to user
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::MintTo {
+                    mint: ctx.accounts.lp_mint.to_account_info(),
+                    to: ctx.accounts.liquidity_to.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                &[authority_seeds],
+            ),
+            liquidity,
+        )?;
+    
+        // Update pair account
+        ctx.accounts.pair.reserve0 = reserve0.checked_add(amount0).unwrap();
+        ctx.accounts.pair.reserve1 = reserve1.checked_add(amount1).unwrap();
+        ctx.accounts.pair.total_supply = total_supply.checked_add(liquidity).unwrap();
+    
+        // If this is the first deposit, add minimum liquidity to total supply
+        if reserve0 == 0 && reserve1 == 0 {
+            ctx.accounts.pair.total_supply = ctx.accounts.pair.total_supply.checked_add(1000).unwrap();
+        }
+    
+        // Emit event
+        emit!(LiquidityAddedEvent {
+            sender: ctx.accounts.sender.key(),
+            amount0,
+            amount1,
+            liquidity,
+        });
+    
+        Ok(())
+    }
+
 }
 
 #[derive(Accounts)]
@@ -298,6 +487,87 @@ pub struct PairCreatedEvent {
     pub pair: Pubkey,
     pub pair_count: u64,
 }
+#[derive(Accounts)]
+pub struct AddLiquidity<'info> {
+    #[account(
+        mut,
+        has_one = owner @ DexError::NotFactoryOwner,
+    )]
+    pub factory: Account<'info, Factory>,
+    
+    #[account(
+        mut,
+        constraint = pair.is_initialized @ DexError::PairNotInitialized,
+        constraint = pair.factory == factory.key() @ DexError::InvalidPairFactory,
+        constraint = pair.token0_account == token0_account.key() @ DexError::InvalidTokenAccount,
+        constraint = pair.token1_account == token1_account.key() @ DexError::InvalidTokenAccount,
+        constraint = pair.lp_mint == lp_mint.key() @ DexError::InvalidLpMint,
+    )]
+    pub pair: Account<'info, PairAccount>,
+    
+    #[account(mut)]
+    pub token0_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub token1_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = user_token0.mint == pair.token0 @ DexError::InvalidTokenAccount,
+        constraint = user_token0.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub user_token0: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = user_token1.mint == pair.token1 @ DexError::InvalidTokenAccount,
+        constraint = user_token1.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub user_token1: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub lp_mint: Account<'info, Mint>,
+    
+    #[account(
+        mut,
+        constraint = liquidity_to.mint == lp_mint.key() @ DexError::InvalidTokenAccount,
+        constraint = liquidity_to.owner == sender.key() @ DexError::InvalidTokenOwner,
+    )]
+    pub liquidity_to: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = burn_account.mint == lp_mint.key() @ DexError::InvalidTokenAccount,
+    )]
+    pub burn_account: Account<'info, TokenAccount>,
+    
+    /// CHECK: This is the PDA authority for the pair
+    #[account(
+        seeds = [
+            b"authority".as_ref(),
+            pair.key().as_ref()
+        ],
+        bump = pair.authority_bump
+    )]
+    pub authority: UncheckedAccount<'info>,
+    
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    
+    /// CHECK: Factory owner required for authorization
+    pub owner: UncheckedAccount<'info>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+// Add this event
+#[event]
+pub struct LiquidityAddedEvent {
+    pub sender: Pubkey,
+    pub amount0: u64,
+    pub amount1: u64,
+    pub liquidity: u64,
+}
 
 #[error_code]
 pub enum DexError {
@@ -309,4 +579,37 @@ pub enum DexError {
     NotFactoryOwner,
     #[msg("Pair is already initialized")]
     PairAlreadyInitialized,
+
+    #[msg("Pair is not initialized")]
+    PairNotInitialized,
+    #[msg("Invalid pair factory")]
+    InvalidPairFactory,
+    #[msg("Invalid token account")]
+    InvalidTokenAccount,
+    #[msg("Invalid LP mint")]
+    InvalidLpMint,
+    #[msg("Invalid token owner")]
+    InvalidTokenOwner,
+    #[msg("Insufficient amount")]
+    InsufficientAmount,
+    #[msg("Insufficient liquidity minted")]
+    InsufficientLiquidityMinted,
+    #[msg("Amount exceeds maximum allowable token quantity")]
+    AmountOverflow,
+}
+
+fn sqrt(value: u128) -> u128 {
+    if value < 2 {
+        return value;
+    }
+
+    let mut x = value / 2;
+    let mut y = (x + value / x) / 2;
+
+    while y < x {
+        x = y;
+        y = (x + value / x) / 2;
+    }
+
+    x
 }
