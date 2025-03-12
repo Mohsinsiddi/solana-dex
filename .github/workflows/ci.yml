@@ -69,6 +69,7 @@ jobs:
       # Run tests
       - name: Run tests
         run: |
+          solana-keygen new --no-bip39-passphrase -o ~/.config/solana/id.json
           anchor test
       
       # Run additional lint checks (optional)
