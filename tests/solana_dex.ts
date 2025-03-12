@@ -20,7 +20,7 @@ describe("solana_dex", () => {
 
   const program = anchor.workspace.SolanaDex as Program<SolanaDex>;
   const wallet = provider.wallet as anchor.Wallet;
-
+  console.log("Admin Wallet address", wallet.publicKey.toString());
   // Create keypairs for test accounts
   const factoryKeypair = anchor.web3.Keypair.generate();
   const lpMintKeypair = anchor.web3.Keypair.generate();
