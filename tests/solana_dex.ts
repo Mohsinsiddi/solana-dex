@@ -257,7 +257,7 @@ describe("solana_dex", () => {
       );
       
       // Mint some tokens to the user
-      const mintAmount = 1_000_000_000; // 1000 tokens assuming 6 decimals
+      const mintAmount = 2_000_000_000_000; // 1000 tokens assuming 6 decimals
       
       await mintToWallet(
         provider.connection, 
@@ -285,10 +285,10 @@ describe("solana_dex", () => {
       console.log("Initial token1 balance:", userToken1Balance);
       
       // Add liquidity
-      const amount0Desired = new anchor.BN(100_000_000); // 100 tokens with 6 decimals
-      const amount1Desired = new anchor.BN(200_000_000); // 200 tokens with 6 decimals
-      const amount0Min = new anchor.BN(90_000_000);     // 90 tokens minimum
-      const amount1Min = new anchor.BN(180_000_000);    // 180 tokens minimum
+      const amount0Desired = new anchor.BN(1000_000_000_000); // 100 tokens with 6 decimals
+      const amount1Desired = new anchor.BN(2000_000_000_000); // 200 tokens with 6 decimals
+      const amount0Min = new anchor.BN(900_000_000_000);     // 90 tokens minimum
+      const amount1Min = new anchor.BN(1800_000_000_000);    // 180 tokens minimum
       
       const tx = await program.methods
         .addLiquidity(
@@ -524,6 +524,242 @@ describe("solana_dex", () => {
     }
   });
   
+  it("Swaps tokens", async () => {
+    try {
+      // Get the user's token accounts
+      const userToken0Account = getAssociatedTokenAddressSync(
+        token0,
+        wallet.publicKey
+      );
+      
+      const userToken1Account = getAssociatedTokenAddressSync(
+        token1,
+        wallet.publicKey
+      );
+      
+      // Check current pool state and token balances
+      const pairBeforeSwap = await program.account.pairAccount.fetch(pairAddress);
+      const userToken0BalanceBefore = await getTokenBalance(provider.connection, userToken0Account);
+      const userToken1BalanceBefore = await getTokenBalance(provider.connection, userToken1Account);
+      
+      console.log("=== POOL STATE BEFORE SWAP ===");
+      console.log("Pool reserve0:", pairBeforeSwap.reserve0.toString());
+      console.log("Pool reserve1:", pairBeforeSwap.reserve1.toString());
+      console.log("User token0 balance:", userToken0BalanceBefore);
+      console.log("User token1 balance:", userToken1BalanceBefore);
+      
+      // Calculate current prices
+      const price0In1Before = (pairBeforeSwap.reserve1.toNumber() / pairBeforeSwap.reserve0.toNumber()).toFixed(6);
+      const price1In0Before = (pairBeforeSwap.reserve0.toNumber() / pairBeforeSwap.reserve1.toNumber()).toFixed(6);
+      
+      console.log("Price (token0 in terms of token1):", price0In1Before);
+      console.log("Price (token1 in terms of token0):", price1In0Before);
+      
+      // First swap: token0 -> token1
+      const amountIn = new anchor.BN(100_000); // 10 tokens with 6 decimals
+      
+      // Calculate expected output amount with 0.3% fee
+      const amountInWithFee = amountIn.muln(997);
+      const numerator = amountInWithFee.mul(pairBeforeSwap.reserve1);
+      const denominator = pairBeforeSwap.reserve0.muln(1000).add(amountInWithFee);
+      const expectedAmountOut = numerator.div(denominator);
+      
+      // Set minimum amount out with 1% slippage tolerance
+      const amountOutMin = expectedAmountOut.muln(99).divn(100);
+      
+      console.log("=== SWAP PARAMETERS (TOKEN0 -> TOKEN1) ===");
+      console.log("Amount in:", amountIn.toString());
+      console.log("Expected amount out:", expectedAmountOut.toString());
+      console.log("Minimum amount out:", amountOutMin.toString());
+      
+      // Execute the swap
+      const tx = await program.methods
+        .swap(
+          amountIn,
+          amountOutMin
+        )
+        .accounts({
+          pair: pairAddress,
+          token0Account: token0AccountKeypair.publicKey,
+          token1Account: token1AccountKeypair.publicKey,
+          tokenIn: userToken0Account,
+          tokenOut: userToken1Account,
+          authority: authorityPDA,
+          sender: wallet.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc({ commitment: 'confirmed' });
+      
+      console.log("Swap transaction signature:", tx);
+      
+      // Get transaction details and logs
+      const txDetails = await provider.connection.getTransaction(tx, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0
+      });
+      
+      if (txDetails && txDetails.meta && txDetails.meta.logMessages) {
+        console.log("Transaction logs:", txDetails.meta.logMessages);
+      }
+      
+      // Check the pool state and balances after swap
+      const pairAfterSwap = await program.account.pairAccount.fetch(pairAddress);
+      const userToken0BalanceAfter = await getTokenBalance(provider.connection, userToken0Account);
+      const userToken1BalanceAfter = await getTokenBalance(provider.connection, userToken1Account);
+      
+      console.log("=== POOL STATE AFTER SWAP ===");
+      console.log("Pool reserve0:", pairAfterSwap.reserve0.toString());
+      console.log("Pool reserve1:", pairAfterSwap.reserve1.toString());
+      console.log("User token0 balance:", userToken0BalanceAfter);
+      console.log("User token1 balance:", userToken1BalanceAfter);
+      
+      // Calculate new prices
+      const price0In1After = (pairAfterSwap.reserve1.toNumber() / pairAfterSwap.reserve0.toNumber()).toFixed(6);
+      const price1In0After = (pairAfterSwap.reserve0.toNumber() / pairAfterSwap.reserve1.toNumber()).toFixed(6);
+      
+      console.log("Price (token0 in terms of token1):", price0In1After);
+      console.log("Price (token1 in terms of token0):", price1In0After);
+      
+      // Calculate actual amounts swapped
+      const token0Spent = userToken0BalanceBefore - userToken0BalanceAfter;
+      const token1Received = userToken1BalanceAfter - userToken1BalanceBefore;
+      
+      console.log("Token0 spent:", token0Spent);
+      console.log("Token1 received:", token1Received);
+      
+      // Verify pool state changes
+      assert.equal(
+        pairAfterSwap.reserve0.sub(pairBeforeSwap.reserve0).toString(),
+        token0Spent.toString(),
+        "Reserve0 increase should match token0 spent"
+      );
+      
+      assert.equal(
+        pairBeforeSwap.reserve1.sub(pairAfterSwap.reserve1).toString(),
+        token1Received.toString(),
+        "Reserve1 decrease should match token1 received"
+      );
+      
+      // Verify price impact
+      assert(
+        parseFloat(price0In1After) < parseFloat(price0In1Before),
+        "Price of token0 in terms of token1 should decrease after selling token0"
+      );
+      
+      assert(
+        parseFloat(price1In0After) > parseFloat(price1In0Before),
+        "Price of token1 in terms of token0 should increase after selling token0"
+      );
+      // Verify constant product (k) value
+      const kBefore = pairBeforeSwap.reserve0.mul(pairBeforeSwap.reserve1);
+      const kAfter = pairAfterSwap.reserve0.mul(pairAfterSwap.reserve1);
+      
+      console.log("K before:", kBefore.toString());
+      console.log("K after:", kAfter.toString());
+      
+      // K should be the same or slightly higher due to fees
+      assert(
+        kAfter.gte(kBefore),
+        "K value should not decrease"
+      );
+      
+      // Now test swap in reverse direction (token1 -> token0)
+      console.log("\n=== TESTING REVERSE SWAP (TOKEN1 -> TOKEN0) ===");
+      
+      const pairBeforeReverseSwap = pairAfterSwap;
+      const amountInReverse = new anchor.BN(token1Received); // Use the amount we just received
+      
+      // Calculate expected output for reverse swap
+      const amountInWithFeeReverse = amountInReverse.muln(997);
+      const numeratorReverse = amountInWithFeeReverse.mul(pairBeforeReverseSwap.reserve0);
+      const denominatorReverse = pairBeforeReverseSwap.reserve1.muln(1000).add(amountInWithFeeReverse);
+      const expectedAmountOutReverse = numeratorReverse.div(denominatorReverse);
+      
+      // Set minimum amount out with 1% slippage tolerance
+      const amountOutMinReverse = expectedAmountOutReverse.muln(99).divn(100);
+      
+      console.log("Amount in (token1):", amountInReverse.toString());
+      console.log("Expected amount out (token0):", expectedAmountOutReverse.toString());
+      console.log("Minimum amount out (token0):", amountOutMinReverse.toString());
+      
+      // Execute the reverse swap
+      const txReverse = await program.methods
+        .swap(
+          amountInReverse,
+          amountOutMinReverse
+        )
+        .accounts({
+          pair: pairAddress,
+          token0Account: token0AccountKeypair.publicKey,
+          token1Account: token1AccountKeypair.publicKey,
+          tokenIn: userToken1Account,
+          tokenOut: userToken0Account,
+          authority: authorityPDA,
+          sender: wallet.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc({ commitment: 'confirmed' });
+      
+      console.log("Reverse swap transaction signature:", txReverse);
+      
+      // Check the pool state after reverse swap
+      const pairAfterReverseSwap = await program.account.pairAccount.fetch(pairAddress);
+      const userToken0BalanceAfterReverse = await getTokenBalance(provider.connection, userToken0Account);
+      const userToken1BalanceAfterReverse = await getTokenBalance(provider.connection, userToken1Account);
+      
+      console.log("=== POOL STATE AFTER REVERSE SWAP ===");
+      console.log("Pool reserve0:", pairAfterReverseSwap.reserve0.toString());
+      console.log("Pool reserve1:", pairAfterReverseSwap.reserve1.toString());
+      console.log("User token0 balance:", userToken0BalanceAfterReverse);
+      console.log("User token1 balance:", userToken1BalanceAfterReverse);
+      
+      // Calculate final prices
+      const price0In1Final = (pairAfterReverseSwap.reserve1.toNumber() / pairAfterReverseSwap.reserve0.toNumber()).toFixed(6);
+      const price1In0Final = (pairAfterReverseSwap.reserve0.toNumber() / pairAfterReverseSwap.reserve1.toNumber()).toFixed(6);
+      
+      console.log("Final price (token0 in terms of token1):", price0In1Final);
+      console.log("Final price (token1 in terms of token0):", price1In0Final);
+      
+      // Calculate actual amounts swapped in reverse
+      const token1Spent = userToken1BalanceAfter - userToken1BalanceAfterReverse;
+      const token0Received = userToken0BalanceAfterReverse - userToken0BalanceAfter;
+      
+      console.log("Token1 spent:", token1Spent);
+      console.log("Token0 received:", token0Received);
+      
+      // Verify price movement in reverse direction
+      assert(
+        parseFloat(price0In1Final) > parseFloat(price0In1After),
+        "Price of token0 in terms of token1 should increase after buying token0"
+      );
+      
+      assert(
+        parseFloat(price1In0Final) < parseFloat(price1In0After),
+        "Price of token1 in terms of token0 should decrease after buying token0"
+      );
+      
+      // Verify final k value
+      const kAfterReverse = pairAfterReverseSwap.reserve0.mul(pairAfterReverseSwap.reserve1);
+      console.log("K after reverse swap:", kAfterReverse.toString());
+      
+      // K should still be the same or higher
+      assert(
+        kAfterReverse.gte(kAfter),
+        "K value should not decrease after reverse swap"
+      );
+      
+      // Note: After two swaps, we should have less tokens than we started with due to fees
+      assert(
+        userToken0BalanceAfterReverse < userToken0BalanceBefore,
+        "User should have less token0 after round-trip swap due to fees"
+      );
+      
+    } catch (error) {
+      console.error("Error swapping tokens:", error);
+      throw error;
+    }
+  });
+
   // Helper functions
   async function mintToWallet(connection, payer, mint, destination, authority, amount) {
     const tx = new anchor.web3.Transaction();

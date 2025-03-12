@@ -376,6 +376,119 @@ pub mod solana_dex {
         Ok(())
     }
 
+    pub fn swap(
+        ctx: Context<Swap>,
+        amount_in: u128,
+        amount_out_min: u128,
+    ) -> Result<()> {
+        // Ensure pair is initialized
+        require!(ctx.accounts.pair.is_initialized, DexError::PairNotInitialized);
+    
+        // Get current reserves and determine input/output token accounts
+        let (reserve_in, reserve_out, is_token0_in) = if ctx.accounts.token_in.mint.eq(&ctx.accounts.pair.token0) {
+            (ctx.accounts.pair.reserve0, ctx.accounts.pair.reserve1, true)
+        } else if ctx.accounts.token_in.mint.eq(&ctx.accounts.pair.token1) {
+            (ctx.accounts.pair.reserve1, ctx.accounts.pair.reserve0, false)
+        } else {
+            return err!(DexError::InvalidTokenAccount);
+        };
+    
+        // Convert amount_in to u64 for token operations
+        let amount_in_u64 = u64::try_from(amount_in)
+            .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+        // Calculate amount out with fee (0.3% fee = multiply by 997 / 1000)
+        let amount_in_with_fee = amount_in.checked_mul(997).unwrap();
+    
+        // Calculate amount out based on constant product formula (k = x * y)
+        let numerator = amount_in_with_fee.checked_mul(reserve_out as u128).unwrap();
+        let denominator = (reserve_in as u128).checked_mul(1000).unwrap().checked_add(amount_in_with_fee).unwrap();
+        let amount_out = numerator.checked_div(denominator).unwrap();
+    
+        // Ensure minimum output amount is met
+        require!(
+            amount_out >= amount_out_min,
+            DexError::InsufficientOutputAmount
+        );
+    
+        // Convert amount_out to u64 for token operations
+        let amount_out_u64 = u64::try_from(amount_out)
+            .map_err(|_| error!(DexError::AmountOverflow))?;
+    
+        // Ensure amount_out is positive and reserves are sufficient
+        require!(amount_out_u64 > 0, DexError::InsufficientOutputAmount);
+        require!(amount_out_u64 <= reserve_out, DexError::InsufficientLiquidity);
+    
+        // Transfer tokens from user to pool
+        token::transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: ctx.accounts.token_in.to_account_info(),
+                    to: if is_token0_in {
+                        ctx.accounts.token0_account.to_account_info()
+                    } else {
+                        ctx.accounts.token1_account.to_account_info()
+                    },
+                    authority: ctx.accounts.sender.to_account_info(),
+                },
+            ),
+            amount_in_u64,
+        )?;
+    
+        // Transfer tokens from pool to user
+        let pair_key = ctx.accounts.pair.key();
+        let authority_seeds = &[
+            b"authority".as_ref(),
+            pair_key.as_ref(),
+            &[ctx.accounts.pair.authority_bump],
+        ];
+    
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                token::Transfer {
+                    from: if is_token0_in {
+                        ctx.accounts.token1_account.to_account_info()
+                    } else {
+                        ctx.accounts.token0_account.to_account_info()
+                    },
+                    to: ctx.accounts.token_out.to_account_info(),
+                    authority: ctx.accounts.authority.to_account_info(),
+                },
+                &[authority_seeds],
+            ),
+            amount_out_u64,
+        )?;
+    
+        // Update reserves
+        if is_token0_in {
+            ctx.accounts.pair.reserve0 = reserve_in.checked_add(amount_in_u64).unwrap();
+            ctx.accounts.pair.reserve1 = reserve_out.checked_sub(amount_out_u64).unwrap();
+        } else {
+            ctx.accounts.pair.reserve1 = reserve_in.checked_add(amount_in_u64).unwrap();
+            ctx.accounts.pair.reserve0 = reserve_out.checked_sub(amount_out_u64).unwrap();
+        }
+    
+        // Verify k is not decreased (protects against price manipulation)
+        let new_reserve0 = ctx.accounts.pair.reserve0 as u128;
+        let new_reserve1 = ctx.accounts.pair.reserve1 as u128;
+        let old_k = (reserve_in as u128).checked_mul(reserve_out as u128).unwrap();
+        let new_k = new_reserve0.checked_mul(new_reserve1).unwrap();
+        
+        require!(new_k >= old_k, DexError::K);
+    
+        // Emit swap event
+        emit!(SwapEvent {
+            sender: ctx.accounts.sender.key(),
+            amount_in: amount_in_u64,
+            amount_out: amount_out_u64,
+            is_token0_in,
+        });
+    
+        Ok(())
+    }
+
 }
 
 #[derive(Accounts)]
@@ -752,6 +865,63 @@ pub struct LiquidityRemovedEvent {
     pub liquidity: u64,
 }
 
+// Add this accounts struct
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    #[account(
+        mut,
+        constraint = pair.is_initialized @ DexError::PairNotInitialized,
+        constraint = pair.token0_account == token0_account.key() @ DexError::InvalidTokenAccount,
+        constraint = pair.token1_account == token1_account.key() @ DexError::InvalidTokenAccount,
+    )]
+    pub pair: Account<'info, PairAccount>,
+    
+    #[account(mut)]
+    pub token0_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub token1_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = token_in.owner == sender.key() @ DexError::InvalidTokenOwner,
+        constraint = (token_in.mint == pair.token0 || token_in.mint == pair.token1) @ DexError::InvalidTokenAccount,
+    )]
+    pub token_in: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = token_out.owner == sender.key() @ DexError::InvalidTokenOwner,
+        constraint = (token_out.mint == pair.token0 || token_out.mint == pair.token1) @ DexError::InvalidTokenAccount,
+        constraint = token_out.mint != token_in.mint @ DexError::IdenticalTokens,
+    )]
+    pub token_out: Account<'info, TokenAccount>,
+    
+    /// CHECK: This is the PDA authority for the pair
+    #[account(
+        seeds = [
+            b"authority".as_ref(),
+            pair.key().as_ref()
+        ],
+        bump = pair.authority_bump
+    )]
+    pub authority: UncheckedAccount<'info>,
+    
+    #[account(mut)]
+    pub sender: Signer<'info>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+// Add this event
+#[event]
+pub struct SwapEvent {
+    pub sender: Pubkey,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub is_token0_in: bool,
+}
+
 #[error_code]
 pub enum DexError {
     #[msg("Tokens cannot be identical")]
@@ -779,6 +949,12 @@ pub enum DexError {
     InsufficientLiquidityMinted,
     #[msg("Amount exceeds maximum allowable token quantity")]
     AmountOverflow,
+    #[msg("Insufficient output amount")]
+    InsufficientOutputAmount,
+    #[msg("Insufficient liquidity")]
+    InsufficientLiquidity,
+    #[msg("K value decreased - this shouldn't happen")]
+    K,
 }
 
 fn sqrt(value: u128) -> u128 {
