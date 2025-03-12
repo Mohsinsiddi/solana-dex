@@ -69,7 +69,7 @@ jobs:
       # Run tests
       - name: Run tests
         run: |
-          anchor test
+          anchor test --provider.wallet ./abcsuNAe31uDTaKBCmvsNuL3f3yq42eUTVkYQM6142F.json
       
       # Run additional lint checks (optional)
       - name: Rust lint
